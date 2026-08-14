@@ -1,0 +1,414 @@
+# Kalender-Display — ESPHome-Konfiguration
+#
+# Hardware:
+#   - Treiberboard: Waveshare "Universal e-Paper ESP32 Driver Board" (ESP32-WROOM-32E), Rev3
+#   - Panel: Waveshare 7.5inch e-Paper HAT (B), SKU 13505, 800x480, Rot/Schwarz/Weiß
+#
+# Stand: ENTWURF G4 ("Top 2 + Zusammenfassung"), JETZT VOLL DATENGETRIEBEN.
+#
+# WICHTIG - Architektur (siehe PDF-Anleitung "Home Assistant einrichten" für Details):
+# Diese Datei zeichnet NUR NOCH. Sie enthält keine Namen, keine Kalender-Verknüpfungen
+# und keine Müll-Termine mehr fest im Code. Stattdessen liest sie EIN einziges Datenpaket
+# (JSON) aus einer Home-Assistant-Sensor-Eigenschaft (sensor.kalender_display_daten,
+# Attribut "payload") und zeichnet daraus dynamisch Kopf, "Heute"-Karten, die 7 Tage-Zeilen
+# und die Fußzeile - inklusive der "Top 2 + N weitere"-Zusammenfassung pro Person und dem
+# automatischen Ausblenden bereits vergangener Termine von heute.
+#
+# Das bedeutet: eine neue Person, ein neuer Kalender oder eine neue Mülltonnen-Art werden
+# NICHT hier eingetragen, sondern in der Home-Assistant-Paketdatei
+# (homeassistant/packages/kalender_display.yaml) - dort ist es klar markiert und in der
+# PDF-Anleitung Schritt für Schritt erklärt. Diese ESPHome-Datei musst du dafür nicht
+# mehr anfassen.
+#
+# Wenn Home Assistant (noch) keine Daten liefert, zeigt das Display einen Warte-Hinweis.
+# Wenn ein Kalender nicht erreichbar ist / Daten unvollständig sind, überschreibt das
+# Display die GESAMTE Fußzeile rot mit einer Fehlermeldung, statt einfach falsche/alte
+# Daten stillschweigend weiter anzuzeigen.
+
+esphome:
+  name: kalender-display
+  friendly_name: Kalender Display
+
+esp32:
+  board: esp32dev
+  framework:
+    type: arduino
+
+# Logging über USB/Netzwerk zum Debuggen
+logger:
+
+# Home-Assistant-API: darüber kommt das Datenpaket (payload) vom HA-Paket
+# (homeassistant/packages/kalender_display.yaml) ins Display.
+api:
+
+# Ermöglicht spätere Updates drahtlos (OTA), ohne erneut per USB anschließen zu müssen
+ota:
+  - platform: esphome
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+  # Fallback-Hotspot, falls die Verbindung zum WLAN fehlschlägt
+  ap:
+    ssid: "Kalender-Display Fallback"
+    password: !secret fallback_password
+
+captive_portal:
+
+# Für das JSON-Datenpaket aus Home Assistant (ArduinoJson unter der Haube)
+json:
+
+# ESPHomes Standard-Zeichensatz enthält nur Basis-ASCII - deutsche Umlaute, ß, den
+# Halbgeviertstrich (–) und den Mittelpunkt (·) muss man explizit mit dazu nehmen,
+# sonst fehlen genau diese Zeichen lautlos auf dem Display. Als Substitution definiert,
+# damit nicht jede Font-Größe die Liste einzeln tippen muss.
+substitutions:
+  glyph_chars: "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyzÄÖÜäöüß .,:;!?()+-–·%/#×⚠"
+
+font:
+  - file: "gfonts://Roboto@700"
+    id: font_xl
+    size: 20
+    glyphs: ${glyph_chars}
+  - file: "gfonts://Roboto@700"
+    id: font_lg
+    size: 16
+    glyphs: ${glyph_chars}
+  - file: "gfonts://Roboto@700"
+    id: font_md
+    size: 14
+    glyphs: ${glyph_chars}
+  - file: "gfonts://Roboto@700"
+    id: font_sm
+    size: 12
+    glyphs: ${glyph_chars}
+  - file: "gfonts://Roboto@700"
+    id: font_xs
+    size: 11
+    glyphs: ${glyph_chars}
+  - file: "gfonts://Roboto@700"
+    id: font_tiny
+    size: 9
+    glyphs: ${glyph_chars}
+
+spi:
+  clk_pin: GPIO13
+  mosi_pin: GPIO14
+
+# Liest das fertig berechnete Datenpaket aus Home Assistant. "payload" ist ein Attribut
+# (kein normaler Zustand!), weil ein normaler HA-Zustand auf 255 Zeichen begrenzt ist -
+# unser Datenpaket ist meist deutlich länger. Siehe PDF-Kapitel 7.
+text_sensor:
+  - platform: homeassistant
+    id: ha_payload
+    entity_id: sensor.kalender_display_daten
+    attribute: payload
+
+display:
+  - platform: waveshare_epaper
+    cs_pin: GPIO15
+    dc_pin: GPIO27
+    busy_pin: GPIO25
+    reset_pin: GPIO26
+    # Panel bestätigt als (V3) -> volles Rot/Schwarz/Weiß-Rendering
+    model: 7.50in-bV3-bwr
+    # Alle Mockups (inkl. G4) sind 1:1 für ein 480x800-Hochformat gezeichnet, das Panel
+    # ist aber nativ 800x480 (Querformat). Mit rotation:90 dreht ESPHome den Puffer so,
+    # dass die Zeichenkoordinaten unten direkt zum Hochformat passen. Falls das Bild nach
+    # dem Flashen auf dem Kopf steht oder seitenverkehrt ist, hier stattdessen 270 probieren.
+    rotation: 90
+    # Home Assistant berechnet die Daten alle 5 Minuten neu (siehe HA-Paketdatei), das
+    # eigentliche e-Paper-Redraw hier bleibt bei 30 Minuten, um das Panel zu schonen und
+    # Flackern zu vermeiden (deckt sich mit dem "Alle 30 Min" in der Fußzeile).
+    update_interval: 1800s
+    lambda: |-
+      auto black = Color(0, 0, 0);
+      auto white = Color(255, 255, 255);
+      auto red   = Color(255, 0, 0);
+      int W = it.get_width();
+      int H = it.get_height();
+
+      std::string payload = id(ha_payload).state;
+      if (payload.empty()) {
+        it.print(W / 2, H / 2 - 10, id(font_lg), black, TextAlign::CENTER, "Warte auf Daten von Home Assistant ...");
+        it.print(W / 2, H / 2 + 16, id(font_xs), black, TextAlign::CENTER,
+                 "Pruefe sensor.kalender_display_daten in Home Assistant");
+        return;
+      }
+
+      // ---- kleine Zeichen-Hilfsfunktionen ----------------------------------------------
+      auto thick_rect = [&](int x, int y, int w, int h, Color col) {
+        it.rectangle(x, y, w, h, col);
+        it.rectangle(x + 1, y + 1, w - 2, h - 2, col);
+      };
+
+      auto badge_big = [&](int cx, int cy, const std::string &label, Color border_col, Color text_col) {
+        it.circle(cx, cy, 15, border_col);
+        it.circle(cx, cy, 14, border_col);
+        it.print(cx, cy, id(font_sm), text_col, TextAlign::CENTER, label.c_str());
+      };
+
+      auto badge_small = [&](int cx, int cy, const std::string &label, bool alle) {
+        if (label.empty())
+          return;
+        if (alle) {
+          it.filled_circle(cx, cy, 8, red);
+          it.print(cx, cy, id(font_tiny), white, TextAlign::CENTER, label.c_str());
+        } else {
+          it.circle(cx, cy, 8, black);
+          it.print(cx, cy, id(font_tiny), black, TextAlign::CENTER, label.c_str());
+        }
+      };
+
+      auto dashed_hline = [&](int x0, int x1, int y) {
+        for (int x = x0; x < x1; x += 6) {
+          it.filled_rectangle(x, y, 3, 1, black);
+        }
+      };
+
+      // Müll-Tag (rote Pille). Die winzige Tonnen-Ikone aus dem Mockup wird bewusst
+      // weggelassen - bei dieser Größe war ein Icon aus reinen Grafik-Primitiven zu
+      // fummelig/fragil, das rote Label allein ist gut lesbar. Gibt die linke Kante zurück.
+      auto trash_tag = [&](int right_x, int cy, const std::string &label) -> int {
+        if (label.empty())
+          return right_x;
+        std::string up = label;
+        for (auto &ch : up) ch = toupper((unsigned char) ch);
+        int tx1, ty1, tw, th;
+        it.get_text_bounds(0, 0, up.c_str(), id(font_tiny), TextAlign::TOP_LEFT, &tx1, &ty1, &tw, &th);
+        int pill_w = tw + 16;
+        int pill_x = right_x - pill_w;
+        it.filled_rectangle(pill_x, cy - 10, pill_w, 20, red);
+        it.print(pill_x + pill_w / 2, cy, id(font_tiny), white, TextAlign::CENTER, up.c_str());
+        return pill_x;
+      };
+
+      // kürzt einen Text mit "..." bis er in max_w passt (für die Fehlermeldung in der Fußzeile)
+      auto fit_text = [&](const std::string &s, auto font, int max_w) -> std::string {
+        int tx1, ty1, tw, th;
+        it.get_text_bounds(0, 0, s.c_str(), font, TextAlign::TOP_LEFT, &tx1, &ty1, &tw, &th);
+        if (tw <= max_w || s.size() < 4)
+          return s;
+        std::string cut = s;
+        while (cut.size() > 4) {
+          cut = cut.substr(0, cut.size() - 1);
+          std::string probe = cut + "...";
+          it.get_text_bounds(0, 0, probe.c_str(), font, TextAlign::TOP_LEFT, &tx1, &ty1, &tw, &th);
+          if (tw <= max_w)
+            return probe;
+        }
+        return cut;
+      };
+
+      // ---- Datenstrukturen: alles, was wir aus dem JSON brauchen, in normale C++- -------
+      // ---- Container kopieren, BEVOR der parse_json-Callback wieder verlässt wird. ------
+      struct Line { std::string t, h; };
+      struct TodayCard { std::string badge, name, more; bool alle; std::vector<Line> lines; };
+      struct DayRow { std::string badge, t, h; bool header, indent, small; };
+      struct DayInfo { std::string lbl, num, trash; std::vector<DayRow> rows; };
+
+      bool data_ok = true;
+      std::string err_text, range_str, today_lbl, footnote, updated, refresh;
+      std::vector<TodayCard> today_cards;
+      std::vector<DayInfo> days;
+
+      bool parse_ok = json::parse_json(payload, [&](JsonObject root) -> bool {
+        data_ok = root["ok"] | true;
+        err_text = std::string((const char *) (root["err"] | ""));
+        range_str = std::string((const char *) (root["range"] | ""));
+        today_lbl = std::string((const char *) (root["today_lbl"] | ""));
+        footnote = std::string((const char *) (root["footnote"] | ""));
+        updated = std::string((const char *) (root["updated"] | ""));
+        refresh = std::string((const char *) (root["refresh"] | ""));
+
+        for (JsonObject c : root["today"].as<JsonArray>()) {
+          TodayCard card;
+          card.badge = std::string((const char *) (c["badge"] | ""));
+          card.name = std::string((const char *) (c["name"] | ""));
+          card.alle = c["alle"] | false;
+          card.more = std::string((const char *) (c["more"] | ""));
+          for (JsonObject l : c["lines"].as<JsonArray>()) {
+            Line ln;
+            ln.t = std::string((const char *) (l["t"] | ""));
+            ln.h = std::string((const char *) (l["h"] | ""));
+            card.lines.push_back(ln);
+          }
+          today_cards.push_back(card);
+        }
+
+        for (JsonObject d : root["days"].as<JsonArray>()) {
+          DayInfo di;
+          di.lbl = std::string((const char *) (d["lbl"] | ""));
+          di.num = std::string((const char *) (d["num"] | ""));
+          di.trash = std::string((const char *) (d["trash"] | ""));
+          for (JsonObject r : d["rows"].as<JsonArray>()) {
+            DayRow dr;
+            dr.badge = std::string((const char *) (r["badge"] | ""));
+            dr.t = std::string((const char *) (r["t"] | ""));
+            dr.h = std::string((const char *) (r["h"] | ""));
+            dr.header = r["header"] | false;
+            dr.indent = r["indent"] | false;
+            dr.small = r["small"] | false;
+            di.rows.push_back(dr);
+          }
+          days.push_back(di);
+        }
+        return true;
+      });
+
+      if (!parse_ok) {
+        it.print(W / 2, H / 2 - 10, id(font_lg), black, TextAlign::CENTER, "Fehler beim Lesen der Kalenderdaten");
+        it.print(W / 2, H / 2 + 16, id(font_xs), black, TextAlign::CENTER, "Pruefe das JSON in Entwicklerwerkzeuge -> Zustaende");
+        return;
+      }
+
+      // ============================== HEADER ==============================
+      it.print(22, 26, id(font_xl), black, TextAlign::CENTER_LEFT, "Naechste Tage");
+      it.print(W - 22, 28, id(font_sm), black, TextAlign::CENTER_RIGHT, range_str.c_str());
+      it.filled_rectangle(0, 44, W, 4, black);
+
+      // ============================== HEUTE-LABEL ==============================
+      it.print(22, 66, id(font_md), black, TextAlign::CENTER_LEFT, today_lbl.c_str());
+
+      // ============================== HEUTE-KARTEN (dynamisch) ==============================
+      int card_x = 22;
+      int card_w = W - 44;
+      int y = 84;
+      const int PAD = 8, HEADER_H = 26, LINE_H = 15, MORE_H = 14, GAP = 6;
+      const size_t MAX_TODAY_CARDS = 5;
+
+      size_t shown_cards = std::min(today_cards.size(), MAX_TODAY_CARDS);
+      for (size_t i = 0; i < shown_cards; i++) {
+        auto &c = today_cards[i];
+        int n_lines = (int) c.lines.size();
+        int more_h = c.more.empty() ? 0 : MORE_H;
+        int card_h = PAD * 2 + HEADER_H + n_lines * LINE_H + more_h;
+        Color txt_col = c.alle ? white : black;
+
+        if (c.alle) {
+          it.filled_rectangle(card_x, y, card_w, card_h, red);
+          badge_big(card_x + 27, y + PAD + 13, c.badge, white, white);
+        } else {
+          thick_rect(card_x, y, card_w, card_h, black);
+          badge_big(card_x + 27, y + PAD + 13, c.badge, black, black);
+        }
+        it.print(card_x + 52, y + PAD + 13, id(font_lg), txt_col, TextAlign::CENTER_LEFT, c.name.c_str());
+
+        int ly = y + PAD + HEADER_H;
+        for (auto &ln : c.lines) {
+          int cy = ly + LINE_H / 2;
+          it.print(card_x + 40, cy, id(font_xs), txt_col, TextAlign::CENTER_LEFT, ln.t.c_str());
+          it.print(card_x + card_w - 12, cy, id(font_xs), txt_col, TextAlign::CENTER_RIGHT, ln.h.c_str());
+          ly += LINE_H;
+        }
+        if (!c.more.empty()) {
+          it.print(card_x + 40, ly + MORE_H / 2, id(font_tiny), txt_col, TextAlign::CENTER_LEFT, c.more.c_str());
+        }
+        y += card_h + GAP;
+      }
+      if (today_cards.size() > MAX_TODAY_CARDS) {
+        std::string note = "+" + std::to_string(today_cards.size() - MAX_TODAY_CARDS) + " weitere Familienmitglieder mit Terminen heute";
+        it.print(card_x, y, id(font_tiny), black, TextAlign::CENTER_LEFT, note.c_str());
+        y += 14;
+      }
+      if (today_cards.empty()) {
+        it.print(card_x, y, id(font_xs), black, TextAlign::CENTER_LEFT, "Keine weiteren Termine heute");
+        y += 20;
+      }
+      y += 4;
+
+      // ============================== ZUKUNFT: TRENNER ==============================
+      it.filled_rectangle(0, y, W, 3, black);
+      y += 3;
+
+      // Unterhalb dieser Marke wird nicht mehr gezeichnet, damit die Fusszeile immer Platz hat
+      const int FOOTER_RESERVE = 46;
+      int max_y = H - FOOTER_RESERVE;
+
+      auto day_label = [&](int yy, int hh, const std::string &name, const std::string &num) {
+        it.print(26, yy + hh / 2 - 9, id(font_xs), black, TextAlign::CENTER, name.c_str());
+        it.print(26, yy + hh / 2 + 9, id(font_md), black, TextAlign::CENTER, num.c_str());
+        it.filled_rectangle(52, yy, 1, hh, black);
+      };
+
+      bool days_truncated = false;
+      for (size_t di = 0; di < days.size(); di++) {
+        auto &d = days[di];
+        // Zeilenhöhe aus den tatsächlichen Zeileninhalten berechnen (nicht fest verdrahtet)
+        int content_h = 0;
+        if (d.rows.empty()) {
+          content_h = 20;
+        } else {
+          for (auto &r : d.rows) {
+            if (r.small) content_h += 14;
+            else if (r.indent) content_h += 16;
+            else if (r.header) content_h += 18;
+            else content_h += 20;
+          }
+        }
+        int row_h = std::max(32, content_h + 12);
+
+        if (y + row_h > max_y) {
+          days_truncated = true;
+          break;
+        }
+
+        day_label(y, row_h, d.lbl, d.num);
+
+        int trash_left = trash_tag(W - 10, y + row_h / 2, d.trash);
+        int right_limit = d.trash.empty() ? (W - 10) : (trash_left - 8);
+
+        int ry = y + 6;
+        if (d.rows.empty()) {
+          it.print(56, y + row_h / 2, id(font_xs), black, TextAlign::CENTER_LEFT, "–");
+        } else {
+          for (auto &r : d.rows) {
+            int line_h = r.small ? 14 : (r.indent ? 16 : (r.header ? 18 : 20));
+            int cy = ry + line_h / 2;
+            if (r.header) {
+              badge_small(64, cy, r.badge, false);
+              it.print(78, cy, id(font_xs), black, TextAlign::CENTER_LEFT, r.t.c_str());
+            } else if (r.indent || r.small) {
+              // "indent" = Detailzeile unter einem Personen-Header (etwas größer),
+              // "small"  = die zusammenfassende "+N weitere (...)"-Zeile (am kleinsten)
+              if (r.small) {
+                it.print(78, cy, id(font_tiny), black, TextAlign::CENTER_LEFT, r.t.c_str());
+              } else {
+                it.print(78, cy, id(font_xs), black, TextAlign::CENTER_LEFT, r.t.c_str());
+              }
+              if (!r.h.empty())
+                it.print(right_limit, cy, id(font_tiny), black, TextAlign::CENTER_RIGHT, r.h.c_str());
+            } else {
+              badge_small(64, cy, r.badge, false);
+              it.print(78, cy, id(font_xs), black, TextAlign::CENTER_LEFT, r.t.c_str());
+              it.print(right_limit, cy, id(font_tiny), black, TextAlign::CENTER_RIGHT, r.h.c_str());
+            }
+            ry += line_h;
+          }
+        }
+        it.filled_rectangle(0, y + row_h, W, 1, black);
+        y += row_h + 1;
+      }
+      if (days_truncated) {
+        it.print(56, std::min(y + 10, max_y - 4), id(font_tiny), red, TextAlign::CENTER_LEFT,
+                 "▾ weitere Tage nicht mehr angezeigt (zu viele Termine)");
+      }
+
+      // ============================== FUSSZEILE ==============================
+      if (data_ok) {
+        it.filled_rectangle(0, H - FOOTER_RESERVE, W, 1, black);
+        it.print(22, H - FOOTER_RESERVE + 14, id(font_tiny), black, TextAlign::CENTER_LEFT, footnote.c_str());
+        it.filled_rectangle(0, H - FOOTER_RESERVE + 28, W, 1, black);
+        std::string upd = "Zuletzt aktualisiert: " + updated;
+        std::string rfr = "Alle 30 Min · Refresh #" + refresh;
+        it.print(22, H - FOOTER_RESERVE + 42, id(font_tiny), black, TextAlign::CENTER_LEFT, upd.c_str());
+        it.print(W - 22, H - FOOTER_RESERVE + 42, id(font_tiny), black, TextAlign::CENTER_RIGHT, rfr.c_str());
+      } else {
+        // Datenprobleme: komplette Fußzeile überschreiben und rot markieren
+        it.filled_rectangle(0, H - FOOTER_RESERVE, W, FOOTER_RESERVE, red);
+        it.print(22, H - FOOTER_RESERVE + 14, id(font_xs), white, TextAlign::CENTER_LEFT, "⚠ FEHLER BEIM LADEN DER KALENDERDATEN");
+        std::string detail = err_text.empty() ? "Bitte Home Assistant pruefen" : err_text;
+        detail = fit_text(detail, id(font_tiny), W - 44);
+        it.print(22, H - FOOTER_RESERVE + 32, id(font_tiny), white, TextAlign::CENTER_LEFT, detail.c_str());
+      }

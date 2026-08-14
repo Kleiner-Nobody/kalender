@@ -1,0 +1,280 @@
+########################################################################################
+# Kalender-Display – Home-Assistant-Paket
+#
+# Diese Datei ist die EINZIGE Stelle, die du bearbeitest, wenn sich an der Familie oder
+# den Mülltonnen-Arten etwas ändert (neue Person, jemand zieht aus, neue Tonne, ...).
+# Die ESPHome-Datei (esphome/kalender-display.yaml) musst du dafür NICHT mehr anfassen –
+# sie liest nur noch die fertig berechneten Daten, die dieses Paket bereitstellt.
+#
+# Was diese Datei tut:
+#   1. Oben (KONFIGURATION) trägst du Familienmitglieder + Mülltonnen-Arten ein, jeweils
+#      verknüpft mit einer Home-Assistant-Kalender-Entity (calendar.xxx).
+#   2. Alle 5 Minuten (und einmal beim HA-Start) holt Home Assistant die Termine der
+#      nächsten 35 Tage für alle eingetragenen Kalender.
+#   3. Daraus wird ein kompaktes JSON-Datenpaket gebaut (Attribut "payload" von
+#      sensor.kalender_display_daten), das exakt die Struktur von ENTWURF G4 abbildet:
+#      - "Heute"-Karten pro Person: höchstens 2 noch bevorstehende Termine + "+N weitere",
+#        bereits vergangene Termine werden automatisch ausgeblendet.
+#      - 7 Tage-Zeilen: mehrere Termine EINER Person werden zu "Top 2 + N weitere"
+#        zusammengefasst, verschiedene Personen mit je einem Termin werden einzeln gezeigt.
+#      - Müll-Tag pro Tag, falls an dem Tag eine Tonne geleert wird.
+#      - ok/err: wird false bzw. ein Fehlertext gesetzt, wenn ein Kalender nicht erreichbar
+#        ist – das ESPHome-Display zeigt dann die komplette Fußzeile rot mit Fehlertext an.
+#   4. ESPHome liest NUR dieses eine Attribut aus und zeichnet danach das Display.
+#
+# WICHTIG – bevor du dieser Datei vertraust:
+# Diese Datei wurde sorgfältig nach der offiziellen Home-Assistant-Dokumentation gebaut,
+# konnte aber in dieser Session NICHT gegen eine echte laufende Home-Assistant-Instanz
+# getestet werden (kein Zugriff auf euer HA von hier aus). Bitte nach der Installation
+# UNBEDINGT Kapitel 9 der PDF-Anleitung ("Testen, bevor du dem Display vertraust") befolgen:
+# dort prüfst du in Entwicklerwerkzeuge -> Zustände, ob sensor.kalender_display_daten ein
+# sauf den ersten Blick sinnvolles JSON zeigt, BEVOR du dich auf die Displayanzeige verlässt.
+#
+# Diese Datei gehört in den Ordner "packages" deiner Home-Assistant-Konfiguration, siehe
+# PDF-Kapitel 7 ("Pakete aktivieren") für die einmalige Einrichtung.
+########################################################################################
+
+counter:
+  kalender_display_refresh:
+    name: "Kalender Display Refresh-Zähler"
+    icon: mdi:refresh
+    initial: 0
+    step: 1
+    restore: true
+
+template:
+  - triggers:
+      - trigger: time_pattern
+        minutes: "/5"
+      - trigger: homeassistant
+        event: start
+
+    variables:
+      ####################################################################################
+      # TEIL 1: KONFIGURATION
+      # ==>  HIER UND NUR HIER trägst du Personen und Mülltonnen-Arten ein.  <==
+      # Siehe PDF-Kapitel 8 ("Eine Person hinzufügen/entfernen") und Kapitel 10
+      # ("Eine Mülltonnen-Art hinzufügen/entfernen") für eine Schritt-für-Schritt-Erklärung.
+      ####################################################################################
+
+      # ---- FAMILIE --------------------------------------------------------------------
+      # Eine Zeile pro Person:
+      #   name   -> wird so auf dem Display angezeigt
+      #   badge  -> 1-2 Buchstaben im runden Symbol (z.B. "A", "K", "Lz") - frei wählbar,
+      #             muss nur zur jeweiligen Person eindeutig sein
+      #   entity -> die Kalender-Entity-ID dieser Person aus Home Assistant (calendar.xxx),
+      #             siehe PDF-Kapitel 4/5, wie du diese Entity bekommst
+      members: >
+        {{ [
+          {'name': 'Annette', 'badge': 'A',  'entity': 'calendar.annette'},
+          {'name': 'Kaspar',  'badge': 'K',  'entity': 'calendar.kaspar'},
+          {'name': 'Luise',   'badge': 'Lz', 'entity': 'calendar.luise'},
+          {'name': 'Lorenz',  'badge': 'Lo', 'entity': 'calendar.lorenz'},
+          {'name': 'Hans',    'badge': 'H',  'entity': 'calendar.hans'},
+          {'name': 'Lutz',    'badge': 'Lt', 'entity': 'calendar.lutz'},
+        ] }}
+
+      # Gemeinsamer Familienkalender (Termine, die alle betreffen, z.B. "Familienessen").
+      # Falls ihr keinen gemeinsamen Kalender wollt: Zeile stehen lassen, aber einen leeren
+      # Kalender eintragen, oder einen der Personenkalender doppelt verwenden.
+      shared_entity: "calendar.familie_alle"
+
+      # ---- MÜLLTONNEN --------------------------------------------------------------------
+      # Eine Zeile pro Abfallart. 'entity' ist ein Kalender, der NUR die Abfuhrtermine
+      # dieser einen Tonne enthält (siehe PDF-Kapitel 6, "Müllkalender einrichten").
+      # Eine Art wird nicht genutzt? Zeile einfach löschen.
+      waste: >
+        {{ [
+          {'label': 'Restmüll',    'entity': 'calendar.abfall_restmuell'},
+          {'label': 'Bioabfall',   'entity': 'calendar.abfall_bioabfall'},
+          {'label': 'Papier',      'entity': 'calendar.abfall_papier'},
+          {'label': 'Gelber Sack', 'entity': 'calendar.abfall_gelber_sack'},
+        ] }}
+
+    actions:
+      - action: calendar.get_events
+        target:
+          entity_id: >
+            {{ (members | map(attribute='entity') | list)
+               + [shared_entity]
+               + (waste | map(attribute='entity') | list) }}
+        data:
+          start_date_time: "{{ now().strftime('%Y-%m-%d 00:00:00') }}"
+          duration:
+            days: 35
+        response_variable: cal_data
+      - action: counter.increment
+        target:
+          entity_id: counter.kalender_display_refresh
+
+    sensor:
+      - name: "Kalender Display Daten"
+        unique_id: kalender_display_daten
+        icon: mdi:calendar-clock
+        state: >
+          {{ 'ok' if (
+               (members | map(attribute='entity') | list + [shared_entity] + (waste | map(attribute='entity') | list))
+               | select('in', cal_data.keys() | list) | list | count
+               ==
+               (members | count) + 1 + (waste | count)
+             ) else 'error' }}
+        attributes:
+          ####################################################################################
+          # TEIL 2: BERECHNUNG (hier musst du normalerweise nichts ändern)
+          ####################################################################################
+          payload: >
+            {%- set months = ['Januar','Februar','März','April','Mai','Juni','Juli','August',
+                               'September','Oktober','November','Dezember'] -%}
+            {%- set months_upper = months | map('upper') | list -%}
+            {%- set wd_short = ['MO','DI','MI','DO','FR','SA','SO'] -%}
+            {%- set wd_long_upper = ['MONTAG','DIENSTAG','MITTWOCH','DONNERSTAG','FREITAG',
+                                      'SAMSTAG','SONNTAG'] -%}
+            {%- set today = now().date() -%}
+            {%- set end_date = today + timedelta(days=7) -%}
+
+            {#- ---- alle Termine einsammeln und pro Person flach in eine Liste packen ---- -#}
+            {%- set ns = namespace(flat=[], errors=[]) -%}
+            {%- for p in members -%}
+              {%- if p.entity in cal_data and cal_data[p.entity] is mapping and 'events' in cal_data[p.entity] -%}
+                {%- for e in cal_data[p.entity].events -%}
+                  {%- set is_allday = (e.start | string | length) <= 10 -%}
+                  {%- set sdt = as_datetime(e.start) -%}
+                  {%- set edt = as_datetime(e.end) -%}
+                  {%- if sdt and edt -%}
+                    {%- set ns.flat = ns.flat + [{'badge': p.badge, 'name': p.name, 'alle': false,
+                          'title': e.summary, 'start': sdt, 'end': edt, 'allday': is_allday,
+                          'date': sdt.date()}] -%}
+                  {%- endif -%}
+                {%- endfor -%}
+              {%- else -%}
+                {%- set ns.errors = ns.errors + [p.name] -%}
+              {%- endif -%}
+            {%- endfor -%}
+            {%- if shared_entity and shared_entity in cal_data and cal_data[shared_entity] is mapping and 'events' in cal_data[shared_entity] -%}
+              {%- for e in cal_data[shared_entity].events -%}
+                {%- set is_allday = (e.start | string | length) <= 10 -%}
+                {%- set sdt = as_datetime(e.start) -%}
+                {%- set edt = as_datetime(e.end) -%}
+                {%- if sdt and edt -%}
+                  {%- set ns.flat = ns.flat + [{'badge': 'A', 'name': 'Familie', 'alle': true,
+                        'title': e.summary, 'start': sdt, 'end': edt, 'allday': is_allday,
+                        'date': sdt.date()}] -%}
+                {%- endif -%}
+              {%- endfor -%}
+            {%- elif shared_entity -%}
+              {%- set ns.errors = ns.errors + ['Alle'] -%}
+            {%- endif -%}
+
+            {#- ---- Mülltermine einsammeln ---- -#}
+            {%- set wns = namespace(entries=[]) -%}
+            {%- for w in waste -%}
+              {%- if w.entity and w.entity in cal_data and cal_data[w.entity] is mapping and 'events' in cal_data[w.entity] -%}
+                {%- for e in cal_data[w.entity].events -%}
+                  {%- set d0 = as_datetime(e.start) -%}
+                  {%- if d0 -%}
+                    {%- set wns.entries = wns.entries + [{'date': d0.date(), 'label': w.label}] -%}
+                  {%- endif -%}
+                {%- endfor -%}
+              {%- elif w.entity -%}
+                {%- set ns.errors = ns.errors + [w.label] -%}
+              {%- endif -%}
+            {%- endfor -%}
+
+            {#- ---- Hilfsfunktion: gruppiert Termine EINES Tages pro Person, kappt auf ---- -#}
+            {#- ---- Top-2 + "N weitere" pro Person (löst das "6-Termine-Chaos"-Problem) ---- -#}
+            {%- macro group_events(evts) -%}
+              {%- set gns = namespace(cards=[]) -%}
+              {#- Personen chronologisch nach ihrem frühesten Termin sortieren (nicht nach
+                  Konfigurationsreihenfolge), damit z.B. ein 17:30-Termin vor einem 18:15-Termin
+                  erscheint, egal wer zuerst in der KONFIGURATION steht. -#}
+              {%- set pkeys = evts | map(attribute='name') | unique | list -%}
+              {%- set pns = namespace(order=[]) -%}
+              {%- for pname in pkeys -%}
+                {%- set pmin = evts | selectattr('name','equalto', pname) | map(attribute='start') | list | min -%}
+                {%- set pns.order = pns.order + [{'name': pname, 'min': pmin}] -%}
+              {%- endfor -%}
+              {%- set persons = pns.order | sort(attribute='min') | map(attribute='name') | list -%}
+              {%- for pname in persons -%}
+                {%- set pevts = evts | selectattr('name','equalto', pname) | sort(attribute='start') | list -%}
+                {%- set badge = pevts[0].badge -%}
+                {%- set is_alle = pevts[0].alle -%}
+                {%- set shown = pevts[:2] -%}
+                {%- set rest = pevts[2:] -%}
+                {%- set lns = namespace(lines=[]) -%}
+                {%- for ev in shown -%}
+                  {%- set lns.lines = lns.lines + [{'t': ev.title, 'h': ('ganztags' if ev.allday else ev.start.strftime('%H:%M'))}] -%}
+                {%- endfor -%}
+                {%- set more = ('+' ~ (rest | count) ~ ' weitere (' ~ (rest | map(attribute='title') | join(', ')) ~ ')') if (rest | count) > 0 else '' -%}
+                {%- set gns.cards = gns.cards + [{'badge': badge, 'name': pname, 'alle': is_alle, 'lines': lns.lines, 'more': more}] -%}
+              {%- endfor -%}
+              {{- gns.cards | to_json -}}
+            {%- endmacro -%}
+
+            {#- ---- HEUTE: nur noch bevorstehende Termine (bereits gelaufene werden ausgeblendet) ---- -#}
+            {%- set today_evts = ns.flat | selectattr('date','equalto', today) | selectattr('end', 'gt', now()) | list -%}
+            {%- set today_cards = group_events(today_evts) | from_json -%}
+
+            {#- ---- 7 folgende Tage ---- -#}
+            {%- set dns = namespace(days=[]) -%}
+            {%- for offset in range(1, 8) -%}
+              {%- set d = today + timedelta(days=offset) -%}
+              {%- set d_evts = ns.flat | selectattr('date','equalto', d) | list -%}
+              {%- set d_cards_all = group_events(d_evts) | from_json -%}
+              {#- Sicherheitsgrenze: mehr als 4 verschiedene Personen an einem Tag würden die Zeile sprengen -#}
+              {%- set d_cards = d_cards_all[:4] -%}
+              {%- set d_overflow = (d_cards_all | count) - (d_cards | count) -%}
+              {%- set rns = namespace(rows=[]) -%}
+              {%- for c in d_cards -%}
+                {%- if (c.lines | count) == 1 and not c.more -%}
+                  {%- set label = (c.lines[0].t if c.alle else (c.name ~ ' – ' ~ c.lines[0].t)) -%}
+                  {%- set rns.rows = rns.rows + [{'badge': c.badge, 't': label, 'h': c.lines[0].h, 'header': false, 'indent': false, 'small': false}] -%}
+                {%- elif (c.lines | count) > 0 -%}
+                  {%- set rns.rows = rns.rows + [{'badge': c.badge, 't': c.name, 'h': '', 'header': true, 'indent': false, 'small': false}] -%}
+                  {%- for l in c.lines -%}
+                    {%- set rns.rows = rns.rows + [{'badge': '', 't': l.t, 'h': l.h, 'header': false, 'indent': true, 'small': false}] -%}
+                  {%- endfor -%}
+                  {%- if c.more -%}
+                    {%- set rns.rows = rns.rows + [{'badge': '', 't': c.more, 'h': '', 'header': false, 'indent': true, 'small': true}] -%}
+                  {%- endif -%}
+                {%- endif -%}
+              {%- endfor -%}
+              {%- if d_overflow > 0 -%}
+                {%- set rns.rows = rns.rows + [{'badge': '', 't': ('+' ~ d_overflow ~ ' weitere Person(en) mit Terminen'), 'h': '', 'header': false, 'indent': true, 'small': true}] -%}
+              {%- endif -%}
+              {%- set trash_d = wns.entries | selectattr('date','equalto', d) | map(attribute='label') | list -%}
+              {%- set dns.days = dns.days + [{'lbl': wd_short[d.weekday()], 'num': d.day | string,
+                    'rows': rns.rows, 'trash': trash_d | join(' + ')}] -%}
+            {%- endfor -%}
+
+            {#- ---- Kopfzeile / Datumsbereich ---- -#}
+            {%- set range_str = (today.day|string ~ '.–' ~ end_date.day|string ~ '. ' ~ months[end_date.month-1])
+                                 if today.month == end_date.month
+                                 else (today.day|string ~ '. ' ~ months[today.month-1] ~ ' – ' ~ end_date.day|string ~ '. ' ~ months[end_date.month-1]) -%}
+            {%- set today_lbl = 'HEUTE · ' ~ wd_long_upper[today.weekday()] ~ ', ' ~ today.day|string ~ '. ' ~ months_upper[today.month-1] -%}
+
+            {#- ---- Fußzeile: nächste Abfuhr NACH dem angezeigten 7-Tage-Fenster ---- -#}
+            {%- set future_waste = wns.entries | selectattr('date','gt', end_date) | list -%}
+            {%- if future_waste | count > 0 -%}
+              {%- set next_date = future_waste | map(attribute='date') | min -%}
+              {%- set next_labels = future_waste | selectattr('date','equalto', next_date) | map(attribute='label') | list -%}
+              {%- set footnote = 'Nächste Abfuhr danach: ' ~ (next_labels | join(' + ')) ~ ' · ' ~ '%02d.%02d' | format(next_date.day, next_date.month) -%}
+            {%- else -%}
+              {%- set footnote = '' -%}
+            {%- endif -%}
+
+            {#- ---- Fehler-/Vollständigkeitsstatus ---- -#}
+            {%- set ok = (ns.errors | count) == 0 -%}
+            {%- set err = ('Kalenderdaten unvollständig: ' ~ (ns.errors | unique | join(', ')) ~ ' nicht erreichbar') if not ok else '' -%}
+
+            {%- set payload = {
+                  'ok': ok,
+                  'err': err,
+                  'range': range_str,
+                  'today_lbl': today_lbl,
+                  'today': today_cards,
+                  'days': dns.days,
+                  'footnote': footnote,
+                  'updated': now().strftime('%H:%M'),
+                  'refresh': states('counter.kalender_display_refresh'),
+                } -%}
+            {{ payload | to_json }}
